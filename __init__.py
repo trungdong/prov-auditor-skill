@@ -3,11 +3,43 @@
 This package provides prov-auditor-skill for Mycroft.
 Author: Trung Dong Huynh
 """
-import logging
+import csv
+from datetime import datetime, timedelta
+import json
+from collections import defaultdict, namedtuple
+from io import StringIO
 from pathlib import Path
+import random
+from typing import Optional
+import uuid
 
 from mycroft import MycroftSkill, intent_file_handler
+from mycroft.identity import IdentityManager
+from mycroft.messagebus.message import Message
+from mycroft.session import SessionManager
 from .skill.provtools import provman_narrate_batch, log2prov
+
+
+# Bindings types
+IntentMatchingBinding = namedtuple(
+    "IntentMatchingBinding",
+    ["isA", "user", "assistant", "utterance", "value", "intent", "intent_type", "skill", "intent_data", "timestamp"]
+)
+UserDatapointBinding = namedtuple(
+    "UserDatapointBinding",
+    ["isA", "user", "user_datapoint", "data_type", "value"]
+)
+SkillInvocationBinding = namedtuple(
+    "SkillInvocationBinding",
+    ["isA", "skill", "service", "intent", "user_ip", "user_datapoint",
+     "request", "req_type", "req_data", "req_timestamp",
+     "response", "res_type", "res_data", "res_timestamp",
+     "service_call"]
+)
+
+
+def random_delay(around_seconds: float) -> timedelta:
+    return timedelta(seconds=random.triangular(0, 2 * around_seconds, around_seconds))
 
 
 class ProvAuditor(MycroftSkill):
@@ -16,15 +48,132 @@ class ProvAuditor(MycroftSkill):
 
     def __init__(self):
         super().__init__("ProvAuditor")
+        self.identity = IdentityManager.get()
+        self.bindings: list[tuple] = []
+        self.current_session_id: Optional[str] = None
+        self.id_counters: Optional[dict[str, int]] = None
+        self.utterance_id_cache: dict[tuple, str] = dict()
+        self.geolocation_id_cache: dict[tuple, str] = dict()
+        self.intent_id_cache: dict[str, str] = dict()
 
     def initialize(self):
-        pass
+        self.add_event("skill.prov_auditor.log_intent", self.handler_log_intent)
+        self.add_event("skill.prov_auditor.log_bindings", self.handler_log_bindings)
+        self.add_event("recognizer_loop:utterance", self.handler_utterance)
+
+    def handler_utterance(self, message):
+        self.check_active_session()
+        utterance_id = self.get_id("utterance")
+        self.utterance_id_cache[tuple(message.data["utterances"])] = utterance_id
+        self.log.info("Utterance %s: %s", utterance_id, message.data["utterances"])
+
+    def handler_log_intent(self, message):
+        timestamp = message.context["timestamp"]
+        # deserialising the original intent message
+        intent_msg: Message = Message.deserialize(message.data)
+        utterance = intent_msg.data["utterance"]
+        utterances = intent_msg.data["utterances"]
+        self.log.info(intent_msg.data)
+        skill_id, intent_type = intent_msg.msg_type.split(":")
+        intent_data = intent_msg.data
+        intent_id = self.get_id("intent")
+        # remembering the last intent_id we saw for this skill
+        self.intent_id_cache[skill_id] = intent_id
+        # removing redundant information
+        if "intent_type" in intent_data:
+            del intent_data["intent_type"]
+        del intent_data["utterance"]
+        del intent_data["utterances"]
+        if "__tags__" in intent_data:
+            del intent_data["__tags__"]
+        # log this binding
+        self.bindings.append(
+            IntentMatchingBinding(
+                "intent_matching",
+                self.get_user_id(),
+                self.identity.uuid,
+                self.utterance_id_cache[tuple(utterances)],
+                utterance,
+                intent_id,
+                f"{skill_id}/{intent_type}",
+                skill_id,
+                json.dumps(intent_data),
+                datetime.fromtimestamp(timestamp).isoformat(),
+            )
+        )
+        self.log.info(self.bindings[-1])
+
+    def handler_log_bindings(self, message):
+        self.log.info(message.serialize())
+        # TODO: check if geolocation data is present before retrieving them
+        latitude = message.data["latitude"]
+        longitude = message.data["longitude"]
+        skill_id = message.context["sender"]
+        request_identifier = "req/" + uuid.uuid4().hex
+        response_identifier = "res/" + uuid.uuid4().hex
+        service_url = message.context["service"]
+        service_call_identifier = "act/" + uuid.uuid4().hex
+        request_time = datetime.fromtimestamp(message.context["timestamp"])
+        response_time = request_time + random_delay(0.4)
+        self.bindings.append(
+            SkillInvocationBinding(
+                "skill_invocation",
+                skill_id,
+                service_url[8:],  # removing "https://"
+                self.intent_id_cache.get(skill_id, None),
+                None,  # TODO: IP address
+                self.get_geolocation_id(latitude, longitude),
+                request_identifier, "APIRequest", None, request_time.isoformat(),
+                response_identifier, "APIResponse", None, response_time.isoformat(),
+                service_call_identifier,
+            )
+        )
+        self.log.info(self.bindings[-1])
 
     @intent_file_handler('auditor.prov.intent')
     def handle_auditor_prov(self, message):
         sentences = self.generate_narratives()
-        for s in sentences:
-            self.speak_dialog(s)
+        if sentences:
+            for s in sentences:
+                self.speak_dialog(s)
+        else:
+            self.speak_dialog("No data was recorded in my log")
+
+    def check_active_session(self) -> None:
+        """
+        Check for the active session and reset all the ID counters if a new session has started
+        """
+        session = SessionManager.get()
+        if session.session_id != self.current_session_id:
+            self.id_counters = defaultdict(int)
+            self.utterance_id_cache = dict()
+            self.current_session_id = session.session_id
+
+    def get_id(self, id_kind: str):
+        self.id_counters[id_kind] += 1
+        return f"{id_kind}/{self.current_session_id}/{self.id_counters[id_kind]}"
+
+    def get_user_id(self) -> str:
+        # TODO: Figure out how to do this
+        return "users/3259"
+
+    def get_user_data_id(self, data_id: str):
+        return f"{self.get_user_id()}/{data_id}"
+
+    def get_geolocation_id(self, latitude, longitude):
+        geolocation_id = self.geolocation_id_cache.get((latitude, longitude), None)
+        if geolocation_id is None:
+            # Create a new ID and register it
+            geolocation_id = f"{self.get_user_data_id('geolocation')}/{len(self.geolocation_id_cache) + 1}"
+            self.geolocation_id_cache[(latitude, longitude)] = geolocation_id
+            self.bindings.append(
+                UserDatapointBinding(
+                    "user_datapoint", self.get_user_id(), geolocation_id, "UserGeoLocation",
+                    f"{latitude},{longitude}"
+                )
+            )
+            self.log.info(self.bindings[-1])
+        return geolocation_id
 
     def generate_narratives(self) -> list[str]:
         provn = self.expand_provenance()
@@ -46,10 +195,19 @@ class ProvAuditor(MycroftSkill):
             'skill_invocation,mycroft-weather,openweathermap.org,intent/6993,users/3259/ip,users/3259/geolocation,req/de473ad391304fb2b634307dc7db6264,APIRequest,,2023-01-12T07:22:17.200082,res/b3121142a3ab448995eac3321b8c5c19,APIResponse,,2023-01-12T07:22:17.271877,act/16cc16ed9cdd4a019773103bffb19f49',
         ]
 
+    def get_csv_bindings_str(self):
+        f = StringIO()
+        csvwriter = csv.writer(f)
+        csvwriter.writerows(self.bindings)
+        return f.getvalue()
+
     def expand_provenance(self) -> str:
-        bindings = self.sample_bindings()
-        self.log.debug("Expanding provenance from %d CSV bindings", len(bindings))
-        return log2prov(bindings)
+        # bindings = self.sample_bindings()
+        # bindings_str = "\n".join(bindings)
+        self.log.info("Expanding provenance from %d CSV bindings", len(self.bindings))
+        bindings_str = self.get_csv_bindings_str()
+        self.log.info("The current CSV bindings:\n%s", bindings_str)
+        return log2prov(bindings_str)
 
 
 def create_skill():

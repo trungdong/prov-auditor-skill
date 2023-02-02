@@ -77,11 +77,10 @@ def provman_narrate_batch(provn: str, templates: Sequence[str], profile: str = N
             return json.load(f)
 
 
-def log2prov(bindings: Sequence[str]) -> str:
+def log2prov(bindings_str: str) -> str:
     with tempfile.TemporaryDirectory() as tmpdirname:
         os.environ["CLASSPATH_PREFIX"] = "/home/tdh/.m2/repository/org/openprovenance/sais/templates_l2p/0.1.0/templates_l2p-0.1.0.jar:/home/tdh/.m2/repository/org/openprovenance/sais/templates_cli/0.1.0/templates_cli-0.1.0.jar"
         output_filepath = os.path.join(tmpdirname, "expansion.provn")
-        bindings_str = "\n".join(bindings)
         arguments = [
             "--infile", "-",
             "--log2prov", "org.openprovenance.sais.Init",
