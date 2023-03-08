@@ -16,7 +16,7 @@ import uuid
 from mycroft import MycroftSkill, intent_file_handler
 from mycroft.identity import IdentityManager
 from mycroft.messagebus.message import Message
-from mycroft.session import SessionManager
+from mycroft.session import Session, SessionManager
 from .skill.provtools import provman_narrate_batch, log2prov
 
 
@@ -43,14 +43,15 @@ def random_delay(around_seconds: float) -> timedelta:
 
 
 class ProvAuditor(MycroftSkill):
-    PROVENANCE_SAMPLE_FILEPATH = Path("/home/tdh/projects/explanations/sais/provenance/sim.provn")
     NARRATIVE_PROFILE = "ln:company-pronoun-1,ln:borrower-person2"
+    PATH_BINDINGS = "bindings"
 
     def __init__(self):
         super().__init__("ProvAuditor")
         self.identity = IdentityManager.get()
         self.bindings: list[tuple] = []
-        self.current_session_id: Optional[str] = None
+        self.path_bindings: Path = Path(self.file_system.path) / self.PATH_BINDINGS
+        self.session: Optional[Session] = None
         self.id_counters: Optional[dict[str, int]] = None
         self.utterance_id_cache: dict[tuple, str] = dict()
         self.geolocation_id_cache: dict[tuple, str] = dict()
@@ -60,6 +61,14 @@ class ProvAuditor(MycroftSkill):
         self.add_event("skill.prov_auditor.log_intent", self.handler_log_intent)
         self.add_event("skill.prov_auditor.log_bindings", self.handler_log_bindings)
         self.add_event("recognizer_loop:utterance", self.handler_utterance)
+        self.add_event("speak", self.handler_speak)
+
+    def handler_speak(self, message):
+        self.log.info(message.data)
+        self.log.info("Spoken by %s: %s", message.data["meta"]["skill"], message.data["utterance"])
+
+    def shutdown(self):
+        self.persist_bindings()
 
     def handler_utterance(self, message):
         self.check_active_session()
@@ -144,14 +153,15 @@ class ProvAuditor(MycroftSkill):
         Check for the active session and reset all the ID counters if a new session has started
         """
         session = SessionManager.get()
-        if session.session_id != self.current_session_id:
-            self.id_counters = defaultdict(int)
-            self.utterance_id_cache = dict()
-            self.current_session_id = session.session_id
+        if session is not self.session:
+            self.persist_bindings()  # store all existing bindings before switching to the new session
+            self.id_counters = defaultdict(int)  # resetting the ID counters
+            self.utterance_id_cache = dict()  # forgetting previous utterances
+            self.session = session  # remembering the current session
 
     def get_id(self, id_kind: str):
         self.id_counters[id_kind] += 1
-        return f"{id_kind}/{self.current_session_id}/{self.id_counters[id_kind]}"
+        return f"{id_kind}/{self.session.session_id}/{self.id_counters[id_kind]}"
 
     def get_user_id(self) -> str:
         # TODO: Figure out how to do this
@@ -195,19 +205,49 @@ class ProvAuditor(MycroftSkill):
             'skill_invocation,mycroft-weather,openweathermap.org,intent/6993,users/3259/ip,users/3259/geolocation,req/de473ad391304fb2b634307dc7db6264,APIRequest,,2023-01-12T07:22:17.200082,res/b3121142a3ab448995eac3321b8c5c19,APIResponse,,2023-01-12T07:22:17.271877,act/16cc16ed9cdd4a019773103bffb19f49',
         ]
 
-    def get_csv_bindings_str(self):
+    def persist_bindings(self):
+        # only proceed if there is some bindings to save
+        if not self.bindings:
+            return  # nothing to save
+        # determine the right path
+        session_ts = self.session.touch_time  # seconds since epoch
+        session_dt = datetime.fromtimestamp(session_ts)
+        folder_path = self.path_bindings / str(session_dt.year) / str(session_dt.month) / str(session_dt.day)
+        if not folder_path.exists():
+            folder_path.mkdir(parents=True, exist_ok=True)
+        file_path = folder_path / f"{self.session.session_id}.csv"
+        # write the bindings to a CSV file
+        with file_path.open("a") as f:
+            csvwriter = csv.writer(f)
+            csvwriter.writerows(self.bindings)
+            self.log.info("%d bindings saved to %s", len(self.bindings), file_path)
+        self.bindings = list()  # forgetting all the current bindings
+
+    def collect_bindings_lines(self) -> str:
+        csv_lines = ""
+        # read all stored bindings
+        for filepath in self.path_bindings.glob("**/*.csv"):
+            with filepath.open() as f:
+                csv_lines += f.read()
+        # append in-memory bindings
+        if self.bindings:
+            csv_lines += self.get_csv_bindings_str()
+        return csv_lines
+
+    def get_csv_bindings_str(self) -> str:
         f = StringIO()
         csvwriter = csv.writer(f)
         csvwriter.writerows(self.bindings)
         return f.getvalue()
 
     def expand_provenance(self) -> str:
-        # bindings = self.sample_bindings()
-        # bindings_str = "\n".join(bindings)
-        self.log.info("Expanding provenance from %d CSV bindings", len(self.bindings))
-        bindings_str = self.get_csv_bindings_str()
-        self.log.info("The current CSV bindings:\n%s", bindings_str)
-        return log2prov(bindings_str)
+        binding_lines = self.collect_bindings_lines()
+        n_bindings_lines = binding_lines.count("\n")
+        if not binding_lines.endswith("\n"):
+            n_bindings_lines += 1
+        self.log.info("Expanding provenance from %d CSV bindings", n_bindings_lines)
+        self.log.info("The current CSV bindings:\n%s", binding_lines)
+        return log2prov(binding_lines)
 
 
 def create_skill():

@@ -50,7 +50,7 @@ def call_external_tool(executable, arguments, pipe_input=None, timeout=None, env
     return stdout.decode()
 
 
-def provman_narrate_batch(provn: str, templates: Sequence[str], profile: str = None) -> dict:
+def provman_narrate_batch(provn: str, templates: Sequence[str], profile: str = None) -> dict[str, str]:
     """Explain command specific to the credit scoring scenario.
     """
     batch_templates = ",".join(f'[{template}]' for template in templates)
